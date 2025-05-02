@@ -1,89 +1,77 @@
-# eval_gcn.py
-import argparse
+# test.py
 import torch
-from client import GCNClient  # 你写好的组合模型
+import argparse
 import os
-import random
-import numpy as np
+from parse import SocialGraphDataset
+from client import GCNClient
 from torch_geometric.loader import DataLoader
 from sklearn.metrics import precision_score, recall_score
 
 
-def set_seed(seed):
-    torch.manual_seed(seed)
-    random.seed(seed)
-    np.random.seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
+def create_multi_label_targets(data):
+    num_nodes = data.num_nodes
+    edge_index = data.edge_index
+    labels = torch.zeros((num_nodes, num_nodes), dtype=torch.float)
+    labels[edge_index[0], edge_index[1]] = 1.0
+    return labels
 
 
-@torch.no_grad()
-def evaluate(model, dataloader, device):
+def evaluate(model, data, device, threshold=0.05):
     model.eval()
-    all_preds = []
-    all_labels = []
+    data = data.to(device)
 
-    for batch in dataloader:
-        batch = batch.to(device)
+    with torch.no_grad():
+        preds, _ = model(data, data.target_labels.to(device))
+        preds = preds.sigmoid()  # 多标签预测用 sigmoid
+        preds_binary = (preds > threshold).float()
 
-        # 前向传播
-        logits, _ = model(batch, batch.target_labels)  # shape: [batch_size, num_classes]
-        preds = torch.argmax(logits, dim=1)  # 每个样本预测一个类别索引
+    y_true = data.target_labels.cpu().numpy()
+    y_pred = preds_binary.cpu().numpy()
 
-        all_preds.append(preds.cpu())
-        all_labels.append(batch.target_labels.cpu())
+    # 展平为一维向量评估
+    y_true_flat = y_true.flatten()
+    y_pred_flat = y_pred.flatten()
 
-    all_preds = torch.cat(all_preds, dim=0).numpy()
-    all_labels = torch.cat(all_labels, dim=0).numpy()
-
-    precision = precision_score(all_labels, all_preds, average='micro', zero_division=0)
-    recall = recall_score(all_labels, all_preds, average='micro', zero_division=0)
+    precision = precision_score(y_true_flat, y_pred_flat, zero_division=0)
+    recall = recall_score(y_true_flat, y_pred_flat, zero_division=0)
 
     return precision, recall
 
 
-
 def main():
-    set_seed(42)
 
     device = torch.device('cpu')
 
-    # === 加载数据 ===
-    data_path = './Dataset/BlogCatalog/client0_train.pt'
-    data = torch.load(data_path)
-    data = data.to(device)
-    test_loader = DataLoader([data], batch_size=32, shuffle=False)
+    # 加载数据
+    data = torch.load('./Raw_Dataset/BlogCatalog-dataset/processed/client_0.pt')
+    data.user_ids = data.original_nodes
+    data.target_labels = create_multi_label_targets(data)
+    if not hasattr(data, 'batch') or data.batch is None:
+        data.batch = torch.zeros(data.num_nodes, dtype=torch.long)
 
-    if not hasattr(data, 'user_ids'):
-        raise ValueError("Data must contain `user_ids` for output dimension")
+    dataloader = DataLoader([data], batch_size=1)
 
-    max_uid = int(data.user_ids.max().item())
-
-    # === 创建模型并加载参数 ===
+    # 构建模型并加载参数
     model = GCNClient(
         in_dim=39,
-        gcn_hidden_dim=32,
-        gcn_out_dim=64,
-        pred_hidden_dim=96,
-        out_dim=max_uid + 1,
+        gcn_hidden_dim=128,
+        gcn_out_dim=128,
+        pred_hidden_dim=128,
+        out_dim=data.num_nodes,  # 输出一个 [N, N] 的矩阵
         gcn_layers=3,
-        pred_layers=4,
-        gcn_dropout=0.2,
-        pred_dropout=0.2
+        pred_layers=6,
+        gcn_dropout=0.4,
+        pred_dropout=0.4
     ).to(device)
-    model.create_optimizer(lr=5e-3, weight_decay=1e-5)
+    model.load_state_dict(torch.load('./Checkpoints_Client_0/client_0_round_6000.pth', map_location=device))
 
-    model_path = 'Check1/client_0_round_50.pth'
-    checkpoint = torch.load(model_path, map_location=device)
-    model.load_state_dict(checkpoint)
-
-    train_acc = evaluate(model, test_loader, device)
-    val_acc = evaluate(model, test_loader, device)
-    test_acc = evaluate(model, test_loader, device)
-
-    print(f"[Eval] Train Acc: {train_acc:.4f} | Val Acc: {val_acc:.4f} | Test Acc: {test_acc:.4f}")
+    # 评估
+    for batch in dataloader:
+        precision, recall = evaluate(model, batch, device)
+        print(f"Client {0} Evaluation Results:")
+        print(f"  Precision: {precision:.4f}")
+        print(f"  Recall:    {recall:.4f}")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

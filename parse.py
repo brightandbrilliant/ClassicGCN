@@ -12,43 +12,39 @@ class SocialGraphDataset(InMemoryDataset):
 
     @property
     def raw_file_names(self):
-        return ['nodes.csv', 'groups.csv', 'node_groups.csv', 'edges.csv']
+        return ['nodes.csv', 'groups.csv', 'group-edges.csv', 'edges.csv']
 
     @property
     def processed_file_names(self):
         return [f'client_{i}.pt' for i in range(self.num_clients)]
 
     def process_node_features_and_labels(self):
-        # 读取节点 ID 列表
-        node_ids = pd.read_csv(osp.join(self.raw_dir, 'nodes.csv'))['node_id'].unique()
-        node_groups = pd.read_csv(osp.join(self.raw_dir, 'node_groups.csv'))
-        group_ids = sorted(pd.read_csv(osp.join(self.raw_dir, 'groups.csv'))['group_id'].unique())
+        # 无列名时，指定 header=None 并自定义列名
+        node_ids = pd.read_csv(osp.join(self.raw_dir, 'nodes.csv'), header=None, names=['node_id'])['node_id'].unique()
+        group_edges = pd.read_csv(osp.join(self.raw_dir, 'group-edges.csv'), header=None, names=['node_id', 'group_id'])
+        group_ids = sorted(pd.read_csv(osp.join(self.raw_dir, 'groups.csv'), header=None, names=['group_id'])['group_id'].unique())
 
-        # one-hot 编码 group 特征
-        group_dummies = pd.get_dummies(node_groups, columns=['group_id'],
+        # One-hot 编码 group 特征
+        group_dummies = pd.get_dummies(group_edges, columns=['group_id'],
                                        prefix='', prefix_sep='').groupby('node_id').max()
 
-        # 确保所有节点都在特征矩阵中
+        # 确保所有节点都有条目
         full_index = pd.Index(node_ids, name='node_id')
         group_dummies = group_dummies.reindex(full_index, fill_value=0)
 
-        # 确保所有 group 列都存在
+        # 补齐缺失的 group 列
         for g in group_ids:
             if g not in group_dummies.columns:
                 group_dummies[g] = 0
         group_dummies = group_dummies[sorted(group_ids)]
 
-        # 特征和标签
         x = torch.tensor(group_dummies.values, dtype=torch.float)
-        y = torch.tensor(group_dummies.values.argmax(axis=1), dtype=torch.long)  # 单标签分类
+        y = torch.tensor(group_dummies.values.argmax(axis=1), dtype=torch.long)
 
         return x, y
 
     def process_edges(self):
-        edges = pd.read_csv(osp.join(self.raw_dir, 'edges.csv'))
-        if not edges['probability'].between(0, 1).all():
-            raise ValueError("Edge probabilities must be in [0,1]")
-
+        edges = pd.read_csv(osp.join(self.raw_dir, 'edges.csv'), header=None, names=['source', 'target'])
         edge_index = torch.tensor(edges[['source', 'target']].values.T, dtype=torch.long)
         return edge_index
 
@@ -73,17 +69,27 @@ class SocialGraphDataset(InMemoryDataset):
             edge_index_sub = data.edge_index[:, edge_mask]
             edge_index_sub, _ = subgraph(selected_nodes, edge_index_sub, relabel_nodes=True)
 
+            num_nodes = selected_nodes.size(0)
+            adj = torch.zeros((num_nodes, num_nodes), dtype=torch.float)
+
+            # edge_index_sub 是已经重新编号的边
+            for i, j in edge_index_sub.t():
+                adj[i, j] = 1.0
+
             client_data = Data(
                 x=data.x[selected_nodes],
                 edge_index=edge_index_sub,
-                y=data.y[selected_nodes],
-                original_nodes=selected_nodes
+                y=adj,
+                original_nodes=selected_nodes,
+                batch=32
             )
+
             client_data_list.append(client_data)
 
         return client_data_list
 
     def process(self):
+        print("Processing...")
         x, y = self.process_node_features_and_labels()
         edge_index = self.process_edges()
 
@@ -104,10 +110,12 @@ class SocialGraphDataset(InMemoryDataset):
 
 
 if __name__ == "__main__":
-    dataset = SocialGraphDataset(root='./data', num_clients=3)
+    dataset = SocialGraphDataset(root="./Raw_Dataset/BlogCatalog-dataset", num_clients=3)
     for i in range(len(dataset)):
         client_data = dataset.get_client_data(i)
         print(f"Client {i}:")
         print("  Features:", client_data.x.shape)
         print("  Edges:", client_data.edge_index.shape)
         print("  Labels:", client_data.y.shape)
+
+

@@ -29,7 +29,7 @@ class GCNClient(nn.Module):
     def forward(self, data: Data, target_labels):
         """
         输入:
-            data: PyG 的图对象，包含 x, edge_index
+            raw: PyG 的图对象，包含 x, edge_index
         输出:
             每个节点的 following 多标签预测 (logits)
         """
