@@ -1,77 +1,70 @@
-# test.py
 import torch
+from client import GCNClient, GraphSAGEClient, GATClient  # 确保路径正确
+from sklearn.metrics import precision_score, recall_score
 import argparse
 import os
-from parse import SocialGraphDataset
-from client import GCNClient
-from torch_geometric.loader import DataLoader
-from sklearn.metrics import precision_score, recall_score
 
 
-def create_multi_label_targets(data):
-    num_nodes = data.num_nodes
-    edge_index = data.edge_index
-    labels = torch.zeros((num_nodes, num_nodes), dtype=torch.float)
-    labels[edge_index[0], edge_index[1]] = 1.0
-    return labels
-
-
-def evaluate(model, data, device, threshold=0.05):
+def load_model(checkpoint_path, model_args, device):
+    model = GraphSAGEClient(**model_args)
+    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+    model.to(device)
     model.eval()
+    return model
+
+
+def evaluate(model, data, device, threshold=0.1):
     data = data.to(device)
 
     with torch.no_grad():
-        preds, _ = model(data, data.target_labels.to(device))
-        preds = preds.sigmoid()  # 多标签预测用 sigmoid
-        preds_binary = (preds > threshold).float()
+        logits, _ = model(data)
+        probs = torch.sigmoid(logits)
 
-    y_true = data.target_labels.cpu().numpy()
-    y_pred = preds_binary.cpu().numpy()
+    # 使用 test_mask 选出测试节点
+    test_mask = data.test_mask
+    preds = (probs[test_mask] > threshold).float().cpu().numpy()
+    labels = data.target_labels[test_mask].cpu().numpy()
 
-    # 展平为一维向量评估
-    y_true_flat = y_true.flatten()
-    y_pred_flat = y_pred.flatten()
-
-    precision = precision_score(y_true_flat, y_pred_flat, zero_division=0)
-    recall = recall_score(y_true_flat, y_pred_flat, zero_division=0)
-
+    precision = precision_score(labels, preds, average='micro', zero_division=0)
+    recall = recall_score(labels, preds, average='micro', zero_division=0)
     return precision, recall
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Evaluate GAT model")
+    parser.add_argument('--data_path', type=str, default='./Parsed_dataset/BlogCatalog/client0.pt')
+    parser.add_argument('--checkpoint_dir', type=str, default='./Check_SAGE')
+    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    args = parser.parse_args()
 
-    device = torch.device('cpu')
+    print(f"Using device: {args.device}")
+    data = torch.load(args.data_path)
 
-    # 加载数据
-    data = torch.load('./Raw_Dataset/BlogCatalog-dataset/processed/client_0.pt')
-    data.user_ids = data.original_nodes
-    data.target_labels = create_multi_label_targets(data)
-    if not hasattr(data, 'batch') or data.batch is None:
-        data.batch = torch.zeros(data.num_nodes, dtype=torch.long)
+    if not hasattr(data, 'test_mask') or not hasattr(data, 'target_labels'):
+        raise ValueError("数据缺失 test_mask 或 target_labels")
 
-    dataloader = DataLoader([data], batch_size=1)
+    in_dim = data.x.shape[1]
+    out_dim = data.target_labels.shape[1]
 
-    # 构建模型并加载参数
-    model = GCNClient(
-        in_dim=39,
-        gcn_hidden_dim=128,
+    model_args = dict(
+        in_dim=in_dim,
+        gcn_hidden_dim=64,
         gcn_out_dim=128,
         pred_hidden_dim=128,
-        out_dim=data.num_nodes,  # 输出一个 [N, N] 的矩阵
+        out_dim=out_dim,
         gcn_layers=3,
-        pred_layers=6,
+        pred_layers=3,
         gcn_dropout=0.4,
-        pred_dropout=0.4
-    ).to(device)
-    model.load_state_dict(torch.load('./Checkpoints_Client_0/client_0_round_6000.pth', map_location=device))
+        pred_dropout=0.4,
+    )
 
-    # 评估
-    for batch in dataloader:
-        precision, recall = evaluate(model, batch, device)
-        print(f"Client {0} Evaluation Results:")
-        print(f"  Precision: {precision:.4f}")
-        print(f"  Recall:    {recall:.4f}")
+    # 遍历所有保存的 checkpoint 进行评估
+    for i in range(1, 21):
+        checkpoint_path = os.path.join(f'Check_SAGE/sage_epoch_{600 * i}.pth')
+        model = load_model(checkpoint_path, model_args, args.device)
+        precision, recall = evaluate(model, data, args.device)
+        print(f"[{checkpoint_path}] Precision: {precision:.4f}, Recall: {recall:.4f}")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
